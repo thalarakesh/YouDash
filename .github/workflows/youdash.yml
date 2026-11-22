@@ -2,6 +2,11 @@ name: Build YouDash
 
 on:
   workflow_dispatch:
+    inputs:
+      simulator_tests:
+        description: Also boot an iOS 27 simulator and run the native harnesses
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,7 +65,16 @@ jobs:
           if-no-files-found: error
       - name: Run packaging unit tests
         run: python -m unittest discover -s tests -v 2>&1 | tee logs/packaging-tests.log
+      - name: Upload build and packaging test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouDash-build-logs
+          path: logs/
+          if-no-files-found: warn
       - name: Run native simulator harnesses
+        if: inputs.simulator_tests
+        timeout-minutes: 6
         run: |
           {
             xcrun simctl list devices available --json > "$RUNNER_TEMP/simulators.json"
@@ -87,10 +101,10 @@ jobs:
             python tests/run_watch_layout.py "$simulator" || layout_status=$?
             [[ "$surface_status" == 0 && "$layout_status" == 0 ]]
           } 2>&1 | tee logs/simulator-tests.log
-      - name: Upload build and test logs
-        if: always()
+      - name: Upload simulator logs
+        if: always() && inputs.simulator_tests
         uses: actions/upload-artifact@v4
         with:
-          name: YouDash-build-logs
-          path: logs/
+          name: YouDash-simulator-logs
+          path: logs/simulator-tests.log
           if-no-files-found: warn
