@@ -1,0 +1,96 @@
+name: Build YouDash
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Select Xcode and install build dependencies
+        run: |
+          mkdir -p logs
+          {
+            xcodebuild -version
+            sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+            echo "iPhoneOS SDK: $sdk_version"
+            [[ "$sdk_version" == 27.* ]]
+            python -m pip install -r requirements-build.txt
+            python -m pip check
+            python -m cyan --help
+          } 2>&1 | tee logs/setup.log
+      - name: Compile and verify the original iOS module
+        run: |
+          {
+            git rev-parse HEAD
+            python scripts/build_carplay.py --compile-only
+            file build/YouTubeCarPlay.dylib
+            test "$(xcrun lipo -archs build/YouTubeCarPlay.dylib)" = arm64
+            xcrun vtool -show-build build/YouTubeCarPlay.dylib > build/module-platform.txt
+            cat build/module-platform.txt
+            grep -Eq '^[[:space:]]*platform IOS[[:space:]]*$' build/module-platform.txt
+            xcrun otool -D build/YouTubeCarPlay.dylib | tee build/module-install-name.txt
+            grep -Fx '@rpath/YouTubeCarPlay.dylib' build/module-install-name.txt
+            (cd build && shasum -a 256 YouTubeCarPlay.dylib > SHA256SUMS)
+          } 2>&1 | tee logs/build.log
+      - name: Upload verified integration module
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubeCarPlay-arm64
+          path: |
+            build/YouTubeCarPlay.dylib
+            build/SHA256SUMS
+            build/module-platform.txt
+            build/module-install-name.txt
+          if-no-files-found: error
+      - name: Run packaging unit tests
+        run: python -m unittest discover -s tests -v 2>&1 | tee logs/packaging-tests.log
+      - name: Run native simulator harnesses
+        run: |
+          {
+            xcrun simctl list devices available --json > "$RUNNER_TEMP/simulators.json"
+            simulator="$(python - "$RUNNER_TEMP/simulators.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as inventory:
+              devices = json.load(inventory)["devices"]
+          for runtime, candidates in devices.items():
+              if ".iOS-27-" in runtime:
+                  for device in candidates:
+                      if device["name"].startswith("iPhone"):
+                          print(device["udid"])
+                          sys.exit(0)
+          sys.exit("No available iOS 27 iPhone simulator")
+          PY
+            )"
+            xcrun simctl boot "$simulator"
+            xcrun simctl bootstatus "$simulator" -b
+            surface_status=0
+            layout_status=0
+            python tests/run_native_surface.py "$simulator" || surface_status=$?
+            python tests/run_watch_layout.py "$simulator" || layout_status=$?
+            [[ "$surface_status" == 0 && "$layout_status" == 0 ]]
+          } 2>&1 | tee logs/simulator-tests.log
+      - name: Upload build and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouDash-build-logs
+          path: logs/
+          if-no-files-found: warn
